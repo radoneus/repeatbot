@@ -1,0 +1,28 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Session, data, and configuration files
+# Ignore the entire data directory, which includes the session and config.json
+/data/
+
+# Gemini CLI session data
+# Ignore the .gemini folder and all its contents
+/.gemini/
+
+# IDE settings
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
