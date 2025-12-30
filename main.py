@@ -169,8 +169,6 @@ async def send_spam_messages(chat_id, message, delay, count, original_msg):
         time_formatted = format_time(delay)
         
         for i in range(1, count + 1):
-            await asyncio.sleep(delay)
-            
             if chat_id not in active_tasks:
                 break
 
@@ -188,6 +186,10 @@ async def send_spam_messages(chat_id, message, delay, count, original_msg):
                 f"⏱ Затримка: {time_formatted}"
             )
             await log_to_chat(log_message)
+
+            # Затримка після повідомлення (крім останнього)
+            if i < count:
+                await asyncio.sleep(delay)
         
         # Завершення
         if chat_id in active_tasks:
