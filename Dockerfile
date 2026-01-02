@@ -7,6 +7,7 @@ WORKDIR /app
 # Встановлюємо системні залежності
 RUN apt-get update && apt-get install -y \
     gcc \
+    sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Копіюємо файл з залежностями
@@ -16,7 +17,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Копіюємо код бота
-COPY main.py .
+COPY . .
 
 # Створюємо директорію для сесії
 RUN mkdir -p /app/data

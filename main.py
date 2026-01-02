@@ -2,8 +2,10 @@ from telethon import TelegramClient, events
 import asyncio
 import re
 import os
+import time
 
-import json
+
+import database
 
 # ============ НАЛАШТУВАННЯ ============
 API_ID = os.getenv('API_ID', 'YOUR_API_ID')
@@ -12,7 +14,7 @@ PHONE = os.getenv('PHONE', '+380XXXXXXXXX')
 
 # Шлях до файлу сесії (для Docker volume)
 SESSION_PATH = os.getenv('SESSION_PATH', 'data/userbot_session')
-CONFIG_FILE = os.path.join('data', 'config.json')
+
 
 # Глобальна змінна для чату логів
 LOG_CHAT = 'me'  # За замовчуванням - Saved Messages
@@ -155,8 +157,8 @@ async def log_to_chat(message):
         print(f"[ERROR] Тип LOG_CHAT: {type(LOG_CHAT)}")
         print(f"[HINT] Спробуйте написати будь-що в цю групу вручну, потім перезапустіть бота")
 
-async def send_spam_messages(chat_id, message, delay, count, original_msg):
-    """Відправляє повідомлення з затримкою, редагуючи перше."""
+async def send_spam_messages(chat_id, message, delay, count, original_msg=None):
+    """Відправляє повідомлення з затримкою, редагуючи перше (або надсилаючи нове, якщо original_msg не задано)."""
     i = 0
     try:
         # Отримуємо інфо про чат для логів
@@ -174,7 +176,10 @@ async def send_spam_messages(chat_id, message, delay, count, original_msg):
 
             # Перше повідомлення редагуємо, решту - відправляємо
             if i == 1:
-                await original_msg.edit(message)
+                if original_msg: # Редагуємо тільки якщо original_msg надано (для нових команд)
+                    await original_msg.edit(message)
+                else: # Якщо відновлюємо з БД, відправляємо як нове повідомлення
+                    await client.send_message(chat_id, message)
             else:
                 await client.send_message(chat_id, message)
             
@@ -186,6 +191,8 @@ async def send_spam_messages(chat_id, message, delay, count, original_msg):
                 f"⏱ Затримка: {time_formatted}"
             )
             await log_to_chat(log_message)
+
+            database.update_sent_count(chat_id, i) # Оновлюємо лічильник відправлених повідомлень в БД
 
             # Затримка після повідомлення (крім останнього)
             if i < count:
@@ -201,6 +208,7 @@ async def send_spam_messages(chat_id, message, delay, count, original_msg):
                 f"⏱ Затримка: {time_formatted}"
             )
             await log_to_chat(final_log)
+            database.remove_spam_task(chat_id) # Видаляємо завдання з БД
             del active_tasks[chat_id]
     
     except asyncio.CancelledError:
@@ -214,6 +222,7 @@ async def send_spam_messages(chat_id, message, delay, count, original_msg):
         )
         await log_to_chat(cancelled_log)
         if chat_id in active_tasks:
+            database.remove_spam_task(chat_id) # Видаляємо завдання з БД
             del active_tasks[chat_id]
     
     except Exception as e:
@@ -227,6 +236,7 @@ async def send_spam_messages(chat_id, message, delay, count, original_msg):
         )
         await log_to_chat(error_log)
         if chat_id in active_tasks:
+            database.remove_spam_task(chat_id) # Видаляємо завдання з БД
             del active_tasks[chat_id]
 
 async def get_chat_info_for_log(chat_id):
@@ -267,9 +277,24 @@ async def spam_handler(event):
     delay, count, message = parsed
     chat_id = event.chat_id
     
-    # Перевіряємо, чи вже є активна задача для цього чату
+    # Додаємо перевірку на кількість
+    if count <= 0:
+        chat_info = await get_chat_info_for_log(event.chat_id)
+        error_msg = "❌ **Кількість повідомлень для розсилки має бути більшою за 0!**"
+        await log_to_chat(f"{chat_info}{error_msg}")
+        await event.delete()
+        return
+
+    # Перевіряємо, чи вже є активна задача для цього чату (в пам'яті)
     if chat_id in active_tasks:
         warning_msg = "⚠️ У цьому чаті вже є активна розсилка!\nВикористайте !stop для зупинки."
+        await log_to_chat(warning_msg)
+        await event.delete()
+        return
+    
+    # Перевіряємо, чи вже є запланована розсилка в БД
+    if database.get_spam_task(chat_id):
+        warning_msg = "⚠️ У цьому чаті вже є запланована розсилка (з БД)!\nВикористайте !stop для зупинки."
         await log_to_chat(warning_msg)
         await event.delete()
         return
@@ -284,6 +309,9 @@ async def spam_handler(event):
     except:
         chat_name = f"Chat {chat_id}"
     
+    # Додаємо завдання в базу даних
+    database.add_spam_task(chat_id, message, delay, count, int(time.time()))
+    
     # Логуємо початок
     start_log = (
         f"🚀 Розсилку запущено!\n\n"
@@ -296,7 +324,7 @@ async def spam_handler(event):
     )
     await log_to_chat(start_log)
     
-    # Створюємо та зберігаємо задачу
+    # Створюємо та зберігаємо задачу в пам'яті
     task = asyncio.create_task(
         send_spam_messages(chat_id, message, delay, count, event.message)
     )
@@ -308,9 +336,18 @@ async def stop_handler(event):
     chat_id = event.chat_id
     chat_info = await get_chat_info_for_log(chat_id)
     
-    if chat_id in active_tasks:
+    is_task_active_in_memory = chat_id in active_tasks
+    is_task_in_database = database.get_spam_task(chat_id) is not None
+
+    if is_task_active_in_memory:
         active_tasks[chat_id].cancel()
+        del active_tasks[chat_id] # Негайно видаляємо з пам'яті
+        database.remove_spam_task(chat_id) # Видаляємо з БД
         await log_to_chat(f"{chat_info}⛔️ Розсилку зупинено командою!")
+        await event.delete()
+    elif is_task_in_database: # Тільки в БД, не в пам'яті (наприклад, після перезапуску)
+        database.remove_spam_task(chat_id) # Видаляємо з БД
+        await log_to_chat(f"{chat_info}⛔️ Заплановану розсилку (з БД) зупинено командою!")
         await event.delete()
     else:
         await log_to_chat(f"{chat_info}ℹ️ Немає активних розсилок у цьому чаті")
@@ -320,20 +357,62 @@ async def stop_handler(event):
 async def status_handler(event):
     """Показує статус всіх активних розсилок"""
     chat_info = await get_chat_info_for_log(event.chat_id)
-    if not active_tasks:
-        await log_to_chat(f"{chat_info}ℹ️ Немає активних розсилок")
-    else:
-        status_text = f"📊 Активних розсилок: {len(active_tasks)}\n\n"
-        for chat_id in active_tasks:
-            try:
-                chat = await client.get_entity(chat_id)
-                chat_name = getattr(chat, 'title', None) or getattr(chat, 'first_name', 'Невідомий чат')
-                status_text += f"• {chat_name} (ID: {chat_id})\n"
-            except:
-                status_text += f"• Чат ID: {chat_id}\n"
+    
+    db_tasks = database.get_all_spam_tasks()
+    all_active_chat_ids = set(active_tasks.keys()) # In-memory tasks
+    
+    status_lines = []
+    
+    if not db_tasks and not active_tasks:
+        await log_to_chat(f"{chat_info}ℹ️ Немає активних або запланованих розсилок")
+        await event.delete()
+        return
+
+    # Додаємо завдання з БД
+    for task_data in db_tasks:
+        chat_id = task_data['chat_id']
+        message = task_data['message']
+        delay = task_data['delay']
+        total_count = task_data['total_count']
+        sent_count = task_data['sent_count']
         
-        status_text += "\n🛑 Використайте !stop в потрібному чаті для зупинки"
-        await log_to_chat(f"{chat_info}{status_text}")
+        chat_name = f"Чат ID: {chat_id}"
+        try:
+            chat = await client.get_entity(chat_id)
+            chat_name = getattr(chat, 'title', None) or getattr(chat, 'first_name', chat_name)
+        except:
+            pass # Keep default chat_name
+
+        status_type = "📊 (З БД)"
+        if chat_id in all_active_chat_ids:
+            status_type = "🚀 (Активна)"
+            all_active_chat_ids.remove(chat_id) # Remove from set to avoid duplication
+
+        status_lines.append(
+            f"• {status_type} {chat_name} (ID: {chat_id})\n"
+            f"  Текст: {message[:30]}...\n"
+            f"  Прогрес: {sent_count}/{total_count}\n"
+            f"  Затримка: {format_time(delay)}\n"
+        )
+    
+    # Додаємо решту завдань, які є тільки в пам'яті (якщо такі є)
+    # Після впровадження БД, цей блок повинен бути порожнім,
+    # оскільки всі активні завдання також мають бути в БД.
+    for chat_id in all_active_chat_ids: # These are tasks that somehow exist only in active_tasks, but not in DB.
+        chat_name = f"Чат ID: {chat_id}"
+        try:
+            chat = await client.get_entity(chat_id)
+            chat_name = getattr(chat, 'title', None) or getattr(chat, 'first_name', chat_name)
+        except:
+            pass 
+        
+        status_lines.append(
+            f"• 📊 (Активна, без БД) {chat_name} (ID: {chat_id})\n" 
+        )
+
+    status_text = f"📊 **Активні та заплановані розсилки:**\n\n" + "".join(status_lines)
+    status_text += "\n🛑 Використайте !stop в потрібному чаті для зупинки"
+    await log_to_chat(f"{chat_info}{status_text}")
     
     await event.delete()
 
@@ -393,7 +472,7 @@ async def set_log_chat(event):
         chat_name = f"ID: {chat_id}"
 
     LOG_CHAT = chat_id
-    save_log_chat(chat_id)  # Зберігаємо ID
+    database.set_config('log_chat_id', chat_id)  # Зберігаємо ID в БД
     
     await log_to_chat(f"✅ Новий чат для логів встановлено: **{chat_name}** (ID: `{chat_id}`)")
     await event.delete()
@@ -419,27 +498,14 @@ async def chatid_handler(event):
     await event.delete()
 
 
-def save_log_chat(chat_id):
-    """Зберігає ID чату для логів у JSON файл."""
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump({'log_chat_id': chat_id}, f)
 
-def load_log_chat():
-    """Завантажує ID чату для логів із JSON файлу."""
-    global LOG_CHAT
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r') as f:
-            try:
-                config = json.load(f)
-                LOG_CHAT = config.get('log_chat_id', 'me')
-            except json.JSONDecodeError:
-                LOG_CHAT = 'me'
-    else:
-        LOG_CHAT = 'me'
 
 async def main():
     """Запуск бота"""
-    load_log_chat()  # Завантажуємо налаштування чату для логів
+    database.init_db()  # Ініціалізуємо базу даних
+    # Завантажуємо налаштування чату для логів з БД
+    global LOG_CHAT
+    LOG_CHAT = int(database.get_config('log_chat_id', default=0)) if database.get_config('log_chat_id', default=0) != 'me' else 'me'
     await client.start(phone=PHONE)
     
     print(f"[INFO] ✅ Userbot запущено!")
@@ -463,6 +529,31 @@ async def main():
             print(f"  2. Ви хоч раз писали в цю групу")
             print(f"  3. Chat ID правильний (напишіть /chatid в групі)")
     
+    # Відновлення незавершених розсилок з БД
+    print("[INFO] 🔄 Відновлення незавершених розсилок з бази даних...")
+    for task_data in database.get_all_spam_tasks():
+        chat_id = task_data['chat_id']
+        message = task_data['message']
+        delay = task_data['delay']
+        total_count = task_data['total_count']
+        sent_count = task_data['sent_count']
+        
+        # Перераховуємо кількість, що залишилася
+        remaining_count = total_count - sent_count
+        
+        if remaining_count > 0:
+            # Створюємо та запускаємо задачу. original_msg=None, бо це відновлення.
+            # Починаємо з відправки нових повідомлень.
+            task = asyncio.create_task(
+                send_spam_messages(chat_id, message, delay, remaining_count, original_msg=None)
+            )
+            active_tasks[chat_id] = task
+            print(f"[INFO] ✅ Відновлено розсилку для чату {chat_id}. Залишилось: {remaining_count}/{total_count}")
+        else:
+            # Завдання вже завершено, але чомусь залишилось в БД. Видаляємо.
+            database.remove_spam_task(chat_id)
+            print(f"[INFO] ⚠️ Видалено завершену розсилку для чату {chat_id} з БД.")
+
     # Тестове повідомлення про запуск
     startup_message = (
         "✅ Userbot запущено!\n\n"
