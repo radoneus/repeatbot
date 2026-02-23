@@ -4,26 +4,24 @@ services:
     container_name: telegram_userbot
     restart: unless-stopped
     
-    # Змінні середовища з файлу .env
     env_file:
       - .env
     
-    # Зберігаємо сесію, щоб не логінитись кожен раз
+    environment:
+      - TZ=Europe/Kyiv
+    
     volumes:
       - ./data:/app/data
     
-    # Інтерактивний режим для введення коду при першому запуску
     stdin_open: true
     tty: true
     
-    # Логування
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
     
-    # Автоматичний перезапуск при помилках
     deploy:
       restart_policy:
         condition: on-failure

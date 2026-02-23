@@ -29,12 +29,16 @@ def init_db(account_id: str) -> None:
                 sent_count INTEGER NOT NULL DEFAULT 0,
                 start_time INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active',
-                last_sent_time INTEGER NOT NULL DEFAULT 0
+                last_sent_time INTEGER NOT NULL DEFAULT 0,
+                weekdays TEXT,
+                scheduled_time INTEGER
             )
         """)
-        # Міграції
+        
+        # Міграція старих таблиць
         c.execute("PRAGMA table_info(spam_tasks)")
         cols = [r[1] for r in c.fetchall()]
+        
         if 'task_id' not in cols:
             c.execute("DROP TABLE spam_tasks")
             c.execute("""
@@ -47,7 +51,9 @@ def init_db(account_id: str) -> None:
                     sent_count INTEGER NOT NULL DEFAULT 0,
                     start_time INTEGER NOT NULL,
                     status TEXT NOT NULL DEFAULT 'active',
-                    last_sent_time INTEGER NOT NULL DEFAULT 0
+                    last_sent_time INTEGER NOT NULL DEFAULT 0,
+                    weekdays TEXT,
+                    scheduled_time INTEGER
                 )
             """)
         else:
@@ -55,6 +61,11 @@ def init_db(account_id: str) -> None:
                 c.execute("ALTER TABLE spam_tasks ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
             if 'last_sent_time' not in cols:
                 c.execute("ALTER TABLE spam_tasks ADD COLUMN last_sent_time INTEGER NOT NULL DEFAULT 0")
+            if 'weekdays' not in cols:
+                c.execute("ALTER TABLE spam_tasks ADD COLUMN weekdays TEXT")
+            if 'scheduled_time' not in cols:
+                c.execute("ALTER TABLE spam_tasks ADD COLUMN scheduled_time INTEGER")
+        
         conn.commit()
 
 
@@ -81,14 +92,16 @@ class DB:
 
     # --- Завдання спаму ---
 
-    def add_spam_task(self, task_id: str, chat_id: int, message: str,
-                      delay: int, total_count: int, start_time: int) -> None:
+    def add_spam_task(self, task_id: str, chat_id: int, message: str, delay: int, 
+                      total_count: int, start_time: int, weekdays: list[int] | None = None,
+                      scheduled_time: int | None = None) -> None:
+        weekdays_str = ','.join(map(str, weekdays)) if weekdays else None
         with self._conn() as conn:
             conn.execute("""
                 INSERT INTO spam_tasks
-                    (task_id, chat_id, message, delay, total_count, sent_count, start_time, status, last_sent_time)
-                VALUES (?, ?, ?, ?, ?, 0, ?, 'active', 0)
-            """, (task_id, chat_id, message, delay, total_count, start_time))
+                    (task_id, chat_id, message, delay, total_count, sent_count, start_time, status, last_sent_time, weekdays, scheduled_time)
+                VALUES (?, ?, ?, ?, ?, 0, ?, 'active', 0, ?, ?)
+            """, (task_id, chat_id, message, delay, total_count, start_time, weekdays_str, scheduled_time))
             conn.commit()
 
     def get_spam_task(self, task_id: str):
@@ -102,15 +115,6 @@ class DB:
             if status:
                 return conn.execute("SELECT * FROM spam_tasks WHERE status = ?", (status,)).fetchall()
             return conn.execute("SELECT * FROM spam_tasks").fetchall()
-
-    def get_spam_tasks_by_chat(self, chat_id: int, status: str = None):
-        with self._conn() as conn:
-            conn.row_factory = sqlite3.Row
-            if status:
-                return conn.execute(
-                    "SELECT * FROM spam_tasks WHERE chat_id = ? AND status = ?", (chat_id, status)
-                ).fetchall()
-            return conn.execute("SELECT * FROM spam_tasks WHERE chat_id = ?", (chat_id,)).fetchall()
 
     def update_sent_count(self, task_id: str, sent_count: int) -> None:
         import time
@@ -129,11 +133,6 @@ class DB:
     def remove_spam_task(self, task_id: str) -> None:
         with self._conn() as conn:
             conn.execute("DELETE FROM spam_tasks WHERE task_id = ?", (task_id,))
-            conn.commit()
-
-    def remove_all_spam_tasks_by_chat(self, chat_id: int) -> None:
-        with self._conn() as conn:
-            conn.execute("DELETE FROM spam_tasks WHERE chat_id = ?", (chat_id,))
             conn.commit()
 
     def make_task_id(self) -> str:

@@ -4,569 +4,640 @@ import re
 import os
 import time
 import signal
+import datetime
 
 from database import DB, init_db
 
-# ============ УТИЛІТИ ============
+# ============ ПАРСИНГ ============
 
 def parse_time(time_str: str) -> int | None:
+    """Парсить затримку: 30с, 5хв, 2г, 1д."""
     time_str = time_str.lower().strip()
-    time_units = {
-        'с': 1,    's': 1,    'sec': 1,
-        'хв': 60,  'м': 60,   'm': 60,   'min': 60,
-        'г': 3600, 'ч': 3600, 'h': 3600, 'hour': 3600,
-        'д': 86400,'d': 86400,'day': 86400,
+    units = {
+        'с': 1, 's': 1, 'хв': 60, 'м': 60, 'm': 60,
+        'г': 3600, 'ч': 3600, 'h': 3600, 'д': 86400, 'd': 86400,
     }
     matches = re.findall(r'(\d+)\s*([a-zа-яії]+)', time_str)
     if not matches:
         return None
     total = 0
     for val, unit in matches:
-        mult = next((m for k, m in time_units.items() if unit.startswith(k)), None)
+        mult = next((m for k, m in units.items() if unit.startswith(k)), None)
         if mult is None:
             return None
         total += int(val) * mult
     return total if total > 0 else None
 
-def parse_command(text: str) -> tuple[int, int, str] | None:
-    m = re.match(r'^!spam\s+([0-9a-zа-яії\s]+?)\s+(\d+)\s+(.+)$',
-                 text.strip(), re.DOTALL | re.IGNORECASE)
-    if not m:
+
+def parse_time_of_day(time_str: str) -> tuple[int, int] | None:
+    """Парсить час доби: 14:30, 2:30pm. Повертає (години, хвилини)."""
+    time_str = time_str.lower().strip()
+    
+    # 12-годинний з am/pm
+    m = re.match(r'^(\d{1,2}):(\d{2})\s*(am|pm|ам|пм)$', time_str)
+    if m:
+        h, mn, period = int(m.group(1)), int(m.group(2)), m.group(3)
+        if h < 1 or h > 12 or mn > 59:
+            return None
+        if period in ('pm', 'пм') and h != 12:
+            h += 12
+        elif period in ('am', 'ам') and h == 12:
+            h = 0
+        return h, mn
+    
+    # 24-годинний
+    m = re.match(r'^(\d{1,2}):(\d{2})$', time_str)
+    if m:
+        h, mn = int(m.group(1)), int(m.group(2))
+        if h > 23 or mn > 59:
+            return None
+        return h, mn
+    
+    return None
+
+
+def parse_weekdays(days_str: str) -> list[int] | None:
+    """Парсить дні: пн,ср,пт або mo,we,fr. Повертає список 0-6."""
+    days_map = {
+        'пн': 0, 'mo': 0, 'вт': 1, 'tu': 1, 'ср': 2, 'we': 2,
+        'чт': 3, 'th': 3, 'пт': 4, 'fr': 4, 'сб': 5, 'sa': 5, 'нд': 6, 'su': 6,
+    }
+    parts = [p.strip().lower() for p in days_str.split(',')]
+    result = []
+    for p in parts:
+        if p not in days_map:
+            return None
+        if days_map[p] not in result:
+            result.append(days_map[p])
+    return sorted(result) if result else None
+
+
+def parse_command(text: str) -> tuple[str, int, int, tuple[int, int] | None, list[int] | None] | None:
+    """
+    !spam <текст> <затримка> <кількість> [час] [дні]
+    Повертає: (message, delay, count, time_of_day, weekdays)
+    """
+    # Прибираємо префікс
+    text = text.strip()
+    if not text.lower().startswith('!spam'):
         return None
-    delay = parse_time(m.group(1).strip())
+    rest = text[5:].strip()
+    if not rest:
+        return None
+
+    tokens = rest.split()
+
+    # Шукаємо з кінця:
+    # - weekdays — останній токен якщо містить лише літери/коми
+    # - time_of_day — передостанній якщо схожий на час
+    # - count — перший числовий токен з кінця після опціональних
+    # - delay — токен перед count
+    # - message — все що залишилось
+
+    weekdays = None
+    time_of_day = None
+
+    # Пробуємо зняти weekdays з кінця
+    if tokens and re.match(r'^[а-яa-z,]+$', tokens[-1], re.IGNORECASE):
+        parsed_wd = parse_weekdays(tokens[-1])
+        if parsed_wd is not None:
+            weekdays = parsed_wd
+            tokens = tokens[:-1]
+
+    # Пробуємо зняти time_of_day з кінця
+    if tokens and re.match(r'^[0-9:apmапмАМПМ]+$', tokens[-1], re.IGNORECASE):
+        parsed_t = parse_time_of_day(tokens[-1])
+        if parsed_t is not None:
+            time_of_day = parsed_t
+            tokens = tokens[:-1]
+
+    # Тепер з кінця: count (ціле число), delay, решта = message
+    if len(tokens) < 3:
+        return None
+
+    # count
+    if not tokens[-1].isdigit():
+        return None
+    count = int(tokens[-1])
+    tokens = tokens[:-1]
+
+    # delay — останній токен що залишився перед message
+    delay = parse_time(tokens[-1])
     if delay is None:
         return None
-    return delay, int(m.group(2)), m.group(3).strip()
+    tokens = tokens[:-1]
+
+    # message — все що залишилось
+    if not tokens:
+        return None
+    message = ' '.join(tokens)
+
+    if count <= 0:
+        return None
+
+    return message, delay, count, time_of_day, weekdays
+
 
 def format_time(seconds: int) -> str:
     if seconds < 60:
         return f"{seconds}с"
     elif seconds < 3600:
-        mn = seconds // 60
-        s = seconds % 60
-        return f"{mn}хв {s}с" if s else f"{mn}хв"
+        mn, s = divmod(seconds, 60)
+        return f"{mn}хв" + (f" {s}с" if s else "")
     elif seconds < 86400:
-        h = seconds // 3600
-        mn = (seconds % 3600) // 60
-        return f"{h}г {mn}хв" if mn else f"{h}г"
+        h, mn = divmod(seconds, 3600)[0], divmod(seconds, 3600)[1] // 60
+        return f"{h}г" + (f" {mn}хв" if mn else "")
     else:
-        d = seconds // 86400
-        h = (seconds % 86400) // 3600
-        return f"{d}д {h}г" if h else f"{d}д"
+        d, h = divmod(seconds, 86400)[0], divmod(seconds, 86400)[1] // 3600
+        return f"{d}д" + (f" {h}г" if h else "")
 
-def get_remaining_wait(row) -> int:
-    last_sent = row['last_sent_time']
-    if last_sent == 0:
-        return row['delay']
-    return max(0, (last_sent + row['delay']) - int(time.time()))
+
+def parse_weekdays_from_db(s: str | None) -> list[int] | None:
+    return [int(d) for d in s.split(',')] if s else None
+
+
+def calculate_next_send_time(last_sent: int, delay: int, weekdays: list[int] | None) -> int:
+    """
+    Рахує наступний час відправлення після першого.
+    scheduled_time більше не потрібен — він лише для першого відправлення.
+    """
+    next_time = last_sent + delay
+
+    if not weekdays:
+        return next_time
+
+    # Перевіряємо чи день підходить
+    next_dt = datetime.datetime.fromtimestamp(next_time)
+    if next_dt.weekday() in weekdays:
+        return next_time
+
+    # Зсуваємо на наступний дозволений день, зберігаючи час доби
+    target_time = next_dt.time()
+    current_date = next_dt.date()
+    current_wd = next_dt.weekday()
+
+    days_ahead = next((wd - current_wd for wd in sorted(weekdays) if wd > current_wd), None)
+    if days_ahead is None:
+        days_ahead = 7 - current_wd + weekdays[0]
+
+    target_dt = datetime.datetime.combine(
+        current_date + datetime.timedelta(days=days_ahead), target_time
+    )
+    return int(target_dt.timestamp())
+
+
+def get_first_send_time(scheduled_time: int | None, weekdays: list[int] | None) -> int:
+    """Рахує час першого відправлення."""
+    now = datetime.datetime.now()
+    
+    if not scheduled_time:
+        # Без фіксованого часу — відправляємо одразу якщо день підходить
+        if not weekdays or now.weekday() in weekdays:
+            return int(now.timestamp())
+        
+        # Шукаємо наступний дозволений день о 00:00
+        current_wd = now.weekday()
+        days_ahead = next((wd - current_wd for wd in sorted(weekdays) if wd > current_wd), None)
+        if days_ahead is None:
+            days_ahead = 7 - current_wd + weekdays[0]
+        
+        target_dt = datetime.datetime.combine(now.date() + datetime.timedelta(days=days_ahead), datetime.time(0, 0))
+        return int(target_dt.timestamp())
+    
+    # Є фіксований час
+    h, mn = divmod(scheduled_time, 60)
+    target_time = datetime.time(h, mn)
+    target_dt = datetime.datetime.combine(now.date(), target_time)
+    
+    # Якщо час ще не минув сьогодні і день підходить
+    if target_dt > now and (not weekdays or now.weekday() in weekdays):
+        return int(target_dt.timestamp())
+    
+    # Інакше — завтра або наступний дозволений день
+    next_date = now.date() + datetime.timedelta(days=1)
+    next_dt = datetime.datetime.combine(next_date, target_time)
+    
+    if not weekdays or next_dt.weekday() in weekdays:
+        return int(next_dt.timestamp())
+    
+    # Шукаємо наступний дозволений день
+    current_wd = next_dt.weekday()
+    days_ahead = next((wd - current_wd for wd in sorted(weekdays) if wd > current_wd), None)
+    if days_ahead is None:
+        days_ahead = 7 - current_wd + weekdays[0]
+    
+    target_dt = datetime.datetime.combine(next_date + datetime.timedelta(days=days_ahead), target_time)
+    return int(target_dt.timestamp())
+
 
 def load_accounts() -> list[dict]:
-    """Завантажує акаунти з .env. Формат: ACCOUNT_1_API_ID, ACCOUNT_1_API_HASH, ACCOUNT_1_PHONE"""
     accounts = []
     i = 1
     while True:
-        api_id   = os.getenv(f'ACCOUNT_{i}_API_ID')
+        api_id = os.getenv(f'ACCOUNT_{i}_API_ID')
         api_hash = os.getenv(f'ACCOUNT_{i}_API_HASH')
-        phone    = os.getenv(f'ACCOUNT_{i}_PHONE')
+        phone = os.getenv(f'ACCOUNT_{i}_PHONE')
         if not api_id or not api_hash or not phone:
             break
         accounts.append({
             'account_id': f'account_{i}',
-            'api_id':     int(api_id),
-            'api_hash':   api_hash,
-            'phone':      phone,
+            'api_id': int(api_id),
+            'api_hash': api_hash,
+            'phone': phone,
         })
         i += 1
     return accounts
+
 
 # ============ КЛАС АКАУНТА ============
 
 class Account:
     def __init__(self, account_id: str, api_id: int, api_hash: str, phone: str) -> None:
         self.account_id = account_id
-        self.phone      = phone
-        self.username   = account_id  # замінюється на реальний після авторизації
-        self.db         = DB(account_id)
+        self.phone = phone
+        self.username = account_id
+        self.db = DB(account_id)
 
         session_dir = os.path.join('data', account_id)
         os.makedirs(session_dir, exist_ok=True)
 
-        self.client     = TelegramClient(
-            os.path.join('data', account_id, 'session'),
-            api_id, api_hash
-        )
+        self.client = TelegramClient(os.path.join(session_dir, 'session'), api_id, api_hash)
         self.log_chat: int | str = 'me'
         self.active_tasks: dict[int, dict[str, asyncio.Task]] = {}
         self._register_handlers()
 
-    # ============ УТИЛІТИ ============
+    def _log(self, msg: str) -> None:
+        print(f"[{self.username}] {msg}")
 
-    def _log(self, message: str) -> None:
-        """Системний лог в консоль з префіксом акаунта."""
-        print(f"[{self.username}] {message}")
+    def _cleanup(self, cid: int, tid: str) -> None:
+        if cid in self.active_tasks:
+            self.active_tasks[cid].pop(tid, None)
+            if not self.active_tasks[cid]:
+                del self.active_tasks[cid]
 
-    def _cleanup_task(self, chat_id: int, task_id: str) -> None:
-        if chat_id in self.active_tasks:
-            self.active_tasks[chat_id].pop(task_id, None)
-            if not self.active_tasks[chat_id]:
-                del self.active_tasks[chat_id]
-
-    def _start_task(self, chat_id: int, task_id: str, coro) -> asyncio.Task:
+    def _start(self, cid: int, tid: str, coro) -> asyncio.Task:
         task = asyncio.create_task(coro)
-        self.active_tasks.setdefault(chat_id, {})[task_id] = task
+        self.active_tasks.setdefault(cid, {})[tid] = task
         return task
 
-    async def log(self, message: str) -> None:
+    async def log(self, msg: str) -> None:
         try:
             if isinstance(self.log_chat, int):
                 try:
-                    entity = await self.client.get_entity(self.log_chat)
-                    await self.client.send_message(entity, message)
+                    await self.client.send_message(await self.client.get_entity(self.log_chat), msg)
                 except ValueError:
-                    async for dialog in self.client.iter_dialogs():
-                        if dialog.id == self.log_chat:
-                            await self.client.send_message(dialog, message)
+                    async for d in self.client.iter_dialogs():
+                        if d.id == self.log_chat:
+                            await self.client.send_message(d, msg)
                             return
                     raise
             else:
-                await self.client.send_message(self.log_chat, message)
+                await self.client.send_message(self.log_chat, msg)
         except Exception as e:
-            self._log(f"[ERROR] Помилка логування: {e}")
+            self._log(f"[ERROR] {e}")
 
-    async def get_chat_name(self, chat_id: int) -> str:
+    async def get_chat_name(self, cid: int) -> str:
         try:
-            chat = await self.client.get_entity(chat_id)
-            return getattr(chat, 'title', None) or getattr(chat, 'first_name', f'ID: {chat_id}')
+            c = await self.client.get_entity(cid)
+            return getattr(c, 'title', None) or getattr(c, 'first_name', f'ID:{cid}')
         except Exception:
-            return f"ID: {chat_id}"
+            return f"ID:{cid}"
 
-    async def get_chat_info(self, chat_id: int) -> str:
-        return f"ℹ️ Команда з чату: **{await self.get_chat_name(chat_id)}**\n\n"
-
-    # ============ ЯДРО РОЗСИЛКИ ============
-
-    async def send_spam_messages(
-        self,
-        chat_id: int,
-        task_id: str,
-        message: str,
-        delay: int,
-        count: int,
-        original_msg=None,
-        initial_wait: int = 0,
-    ) -> None:
+    async def _spam(self, cid: int, tid: str, msg: str, delay: int, count: int, 
+                    original=None, scheduled_time: int | None = None, weekdays: list[int] | None = None) -> None:
         i = 0
-        chat_name = await self.get_chat_name(chat_id)
-        time_fmt = format_time(delay)
-
+        cname = await self.get_chat_name(cid)
+        
         try:
-            if initial_wait > 0:
-                await asyncio.sleep(initial_wait)
+            # Перше відправлення
+            first_time = get_first_send_time(scheduled_time, weekdays)
+            wait = max(0, first_time - int(time.time()))
+            
+            if wait > 0:
+                next_dt = datetime.datetime.fromtimestamp(first_time)
+                self._log(f"[{tid}] Перше повідомлення: {next_dt.strftime('%d.%m %H:%M')} (через {format_time(wait)})")
+                await asyncio.sleep(wait)
 
             for i in range(1, count + 1):
-                if chat_id not in self.active_tasks or task_id not in self.active_tasks[chat_id]:
+                if cid not in self.active_tasks or tid not in self.active_tasks[cid]:
                     break
 
-                if i == 1 and original_msg:
-                    await original_msg.edit(message)
+                if i == 1 and original and wait == 0:
+                    await original.edit(msg)
                 else:
-                    await self.client.send_message(chat_id, message)
+                    await self.client.send_message(cid, msg)
 
-                await self.log(
-                    f"📤 [{task_id}] Відправлено {i}/{count}\n"
-                    f"👤 Чат: {chat_name}\n"
-                    f"💬 Текст: {message}\n"
-                    f"⏱ Затримка: {time_fmt}"
-                )
-                self.db.update_sent_count(task_id, i)
+                current = int(time.time())
+                await self.log(f"📤 [{tid}] {i}/{count}\n👤 {cname}\n💬 {msg}")
+                self.db.update_sent_count(tid, i)
 
                 if i < count:
-                    await asyncio.sleep(delay)
+                    next_time = calculate_next_send_time(current, delay, weekdays)  # ← прибрали scheduled_time
+                    wait_sec = max(0, next_time - int(time.time()))
+                    
+                    if wait_sec > delay + 3600:
+                        ndt = datetime.datetime.fromtimestamp(next_time)
+                        self._log(f"[{tid}] Наступне: {ndt.strftime('%d.%m %H:%M')} (через {format_time(wait_sec)})")
+                    
+                    await asyncio.sleep(wait_sec)
 
-            if chat_id in self.active_tasks and task_id in self.active_tasks[chat_id]:
-                await self.log(
-                    f"✅ [{task_id}] Розсилку завершено!\n\n"
-                    f"👤 Чат: {chat_name}\n"
-                    f"📊 Відправлено: {count}\n"
-                    f"💬 Текст: {message}\n"
-                    f"⏱ Затримка: {time_fmt}"
-                )
-                self.db.remove_spam_task(task_id)
-                self._cleanup_task(chat_id, task_id)
+            if cid in self.active_tasks and tid in self.active_tasks[cid]:
+                await self.log(f"✅ [{tid}] Завершено\n👤 {cname} · 📊 {count}")
+                self.db.remove_spam_task(tid)
+                self._cleanup(cid, tid)
 
         except asyncio.CancelledError:
-            self._cleanup_task(chat_id, task_id)
+            self._cleanup(cid, tid)
             raise
-
         except Exception as e:
-            await self.log(f"❌ [{task_id}] Помилка!\n👤 {chat_name}\n💬 {message}\n⚠️ {e}")
-            self.db.remove_spam_task(task_id)
-            self._cleanup_task(chat_id, task_id)
-
-    # ============ ДОПОМІЖНІ ДЛЯ КОМАНД ============
-
-    async def _stop_one(self, task_id: str, chat_info: str) -> None:
-        row = self.db.get_spam_task(task_id)
-        if not row:
-            await self.log(f"{chat_info}❌ Розсилку `{task_id}` не знайдено.")
-            return
-        chat_id = row['chat_id']
-        task = self.active_tasks.get(chat_id, {}).get(task_id)
-        if task:
-            task.cancel()
-            await asyncio.sleep(0)
-        self.db.remove_spam_task(task_id)
-        self._cleanup_task(chat_id, task_id)
-        await self.log(
-            f"{chat_info}⛔️ [{task_id}] Зупинено і видалено.\n"
-            f"👤 {await self.get_chat_name(chat_id)} · 📊 {row['sent_count']}/{row['total_count']}"
-        )
-
-    async def _stop_all(self, chat_info: str) -> None:
-        all_tasks = self.db.get_all_spam_tasks()
-        if not all_tasks and not self.active_tasks:
-            await self.log(f"{chat_info}ℹ️ Немає активних розсилок.")
-            return
-        for chat_tasks in self.active_tasks.values():
-            for task in chat_tasks.values():
-                task.cancel()
-        await asyncio.sleep(0)
-        self.active_tasks.clear()
-        for row in all_tasks:
-            self.db.remove_spam_task(row['task_id'])
-        await self.log(f"{chat_info}⛔️ Зупинено і видалено {len(all_tasks)} розсилок.")
-
-    async def _pause_one(self, task_id: str, chat_info: str) -> None:
-        row = self.db.get_spam_task(task_id)
-        if not row:
-            await self.log(f"{chat_info}❌ Розсилку `{task_id}` не знайдено.")
-            return
-        chat_id = row['chat_id']
-        task = self.active_tasks.get(chat_id, {}).get(task_id)
-        if task:
-            task.cancel()
-            await asyncio.sleep(0)
-        self.db.set_task_status(task_id, 'paused')
-        await self.log(
-            f"⏸ [{task_id}] Призупинено.\n"
-            f"👤 {await self.get_chat_name(chat_id)} · 📊 {row['sent_count']}/{row['total_count']}\n"
-            f"`!continue {task_id}` — продовжити"
-        )
-
-    async def _pause_all(self, chat_info: str) -> None:
-        all_tasks = self.db.get_all_spam_tasks(status='active')
-        if not all_tasks and not self.active_tasks:
-            await self.log(f"{chat_info}ℹ️ Немає активних розсилок.")
-            return
-        for chat_tasks in self.active_tasks.values():
-            for task in chat_tasks.values():
-                task.cancel()
-        await asyncio.sleep(0)
-        for row in all_tasks:
-            self.db.set_task_status(row['task_id'], 'paused')
-        await self.log(
-            f"{chat_info}⏸ Призупинено {len(all_tasks)} розсилок.\n"
-            f"`!continueall` — відновити всі"
-        )
-
-    async def _resume_one(self, task_id: str, chat_info: str, silent: bool = False) -> bool:
-        row = self.db.get_spam_task(task_id)
-        if not row:
-            if not silent:
-                await self.log(f"{chat_info}❌ Розсилку `{task_id}` не знайдено.")
-            return False
-        if row['status'] != 'paused':
-            if not silent:
-                await self.log(f"{chat_info}⚠️ [{task_id}] не призупинена (статус: {row['status']}).")
-            return False
-
-        chat_id   = row['chat_id']
-        remaining = row['total_count'] - row['sent_count']
-        if remaining <= 0:
-            self.db.remove_spam_task(task_id)
-            if not silent:
-                await self.log(f"{chat_info}ℹ️ [{task_id}] вже завершена, видалено з БД.")
-            return False
-
-        initial_wait = get_remaining_wait(row)
-        self.db.set_task_status(task_id, 'active')
-
-        if not silent:
-            wait_str = f"чекати {format_time(initial_wait)}" if initial_wait > 0 else "відправляє одразу"
-            await self.log(
-                f"▶️ [{task_id}] Відновлено ({wait_str}).\n"
-                f"👤 {await self.get_chat_name(chat_id)} · 📊 {row['sent_count']}/{row['total_count']}"
-            )
-
-        self._start_task(chat_id, task_id,
-            self.send_spam_messages(chat_id, task_id, row['message'], row['delay'], remaining,
-                                    initial_wait=initial_wait))
-        return True
+            await self.log(f"❌ [{tid}] Помилка\n👤 {cname}\n⚠️ {e}")
+            self.db.remove_spam_task(tid)
+            self._cleanup(cid, tid)
 
     # ============ ОБРОБНИКИ КОМАНД ============
 
-    def _register_handlers(self) -> None:
-
-        @self.client.on(events.NewMessage(outgoing=True, pattern=r'^!spam'))
-        async def spam_handler(event) -> None:
-            parsed = parse_command(event.raw_text)
-            chat_id = event.chat_id
-            chat_info = await self.get_chat_info(chat_id)
-
-            if not parsed:
-                await self.log(
-                    f"{chat_info}❌ **Невірний формат!**\n\n"
-                    "`!spam <час> <кількість> <текст>`\n\n"
-                    "⏱ Формати: `30с`, `5хв`, `2г`, `1д`, `1г30хв`\n"
-                    "Приклад: `!spam 30с 10 Привіт як справи`"
-                )
-                await event.delete()
-                return
-
-            delay, count, message = parsed
-            if count <= 0:
-                await self.log(f"{chat_info}❌ Кількість має бути > 0.")
-                await event.delete()
-                return
-
-            task_id = self.db.make_task_id()
-            chat_name = await self.get_chat_name(chat_id)
-            existing = len(self.active_tasks.get(chat_id, {}))
-            extra = f"\n⚡️ Активних у цьому чаті: {existing + 1}" if existing > 0 else ""
-
-            self.db.add_spam_task(task_id, chat_id, message, delay, count, int(time.time()))
+    async def _handle_spam(self, e) -> None:
+        parsed = parse_command(e.raw_text)
+        cid = e.chat_id
+        
+        if not parsed:
             await self.log(
-                f"🚀 [{task_id}] Розсилку запущено!{extra}\n\n"
-                f"👤 {chat_name}\n💬 {message}\n"
-                f"⏱ {format_time(delay)} · 🔢 {count}\n\n"
-                f"`!stop {task_id}` — зупинити | `!stop` — всі"
+                "❌ Невірний формат\n\n"
+                "`!spam <текст> <затримка> <кількість> [час] [дні]`\n\n"
+                "Приклади:\n"
+                "`!spam Привіт 1д 10` — щодня в цей же час\n"
+                "`!spam Привіт 1д 10 14:30` — щодня о 14:30\n"
+                "`!spam Привіт 1д 10 2:30pm пн,ср` — о 14:30 тільки пн/ср"
             )
-            self._start_task(chat_id, task_id,
-                self.send_spam_messages(chat_id, task_id, message, delay, count, event.message))
+            await e.delete()
+            return
 
-        @self.client.on(events.NewMessage(outgoing=True, pattern=r'^!stop'))
-        async def stop_handler(event) -> None:
-            chat_info = await self.get_chat_info(event.chat_id)
-            parts = event.raw_text.strip().split()
-            if len(parts) > 1:
-                await self._stop_one(parts[1], chat_info)
+        message, delay, count, time_of_day, weekdays = parsed
+        if count <= 0:
+            await self.log("❌ Кількість > 0")
+            await e.delete()
+            return
+
+        tid = self.db.make_task_id()
+        scheduled_time = time_of_day[0] * 60 + time_of_day[1] if time_of_day else None
+        
+        self.db.add_spam_task(tid, cid, message, delay, count, int(time.time()), weekdays, scheduled_time)
+        
+        wd_names = {0:'пн',1:'вт',2:'ср',3:'чт',4:'пт',5:'сб',6:'нд'}
+        info = f"\n📅 {','.join(wd_names[d] for d in weekdays)}" if weekdays else ""
+        if time_of_day:
+            info += f" о {time_of_day[0]:02d}:{time_of_day[1]:02d}"
+        
+        await self.log(f"🚀 [{tid}] Запущено{info}\n👤 {await self.get_chat_name(cid)}\n💬 {message}")
+        
+        should_delete = False
+        if weekdays or time_of_day:
+            first_time = get_first_send_time(scheduled_time, weekdays)
+            should_delete = first_time > int(time.time()) + 60
+        
+        self._start(cid, tid, self._spam(cid, tid, message, delay, count, 
+                                         None if should_delete else e.message, 
+                                         scheduled_time, weekdays))
+        if should_delete:
+            await e.delete()
+
+    async def _handle_stop(self, e) -> None:
+        parts = e.raw_text.strip().split()
+        if len(parts) > 1:
+            tid = parts[1]
+            row = self.db.get_spam_task(tid)
+            if row:
+                t = self.active_tasks.get(row['chat_id'], {}).get(tid)
+                if t:
+                    t.cancel()
+                    await asyncio.sleep(0)
+                self.db.remove_spam_task(tid)
+                self._cleanup(row['chat_id'], tid)
+                await self.log(f"⛔️ [{tid}] Зупинено")
             else:
-                await self._stop_all(chat_info)
-            await event.delete()
+                await self.log(f"❌ [{tid}] не знайдено")
+        else:
+            all_t = self.db.get_all_spam_tasks()
+            for ct in self.active_tasks.values():
+                for t in ct.values():
+                    t.cancel()
+            await asyncio.sleep(0)
+            self.active_tasks.clear()
+            for r in all_t:
+                self.db.remove_spam_task(r['task_id'])
+            await self.log(f"⛔️ Зупинено {len(all_t)}")
+        await e.delete()
 
-        @self.client.on(events.NewMessage(outgoing=True, pattern=r'^!pause(?!all)'))
-        async def pause_handler(event) -> None:
-            chat_info = await self.get_chat_info(event.chat_id)
-            parts = event.raw_text.strip().split()
-            if len(parts) < 2:
-                await self.log(f"{chat_info}❌ Вкажіть ID: `!pause <id>`")
-                await event.delete()
-                return
-            await self._pause_one(parts[1], chat_info)
-            await event.delete()
+    async def _handle_pause(self, e) -> None:
+        parts = e.raw_text.strip().split()
+        if len(parts) < 2:
+            await self.log("❌ `!pause <id>`")
+            await e.delete()
+            return
+        tid = parts[1]
+        row = self.db.get_spam_task(tid)
+        if row:
+            t = self.active_tasks.get(row['chat_id'], {}).get(tid)
+            if t:
+                t.cancel()
+                await asyncio.sleep(0)
+            self.db.set_task_status(tid, 'paused')
+            await self.log(f"⏸ [{tid}] Призупинено")
+        else:
+            await self.log(f"❌ [{tid}] не знайдено")
+        await e.delete()
 
-        @self.client.on(events.NewMessage(outgoing=True, pattern=r'^!pauseall'))
-        async def pauseall_handler(event) -> None:
-            await self._pause_all(await self.get_chat_info(event.chat_id))
-            await event.delete()
+    async def _handle_pauseall(self, e) -> None:
+        all_t = self.db.get_all_spam_tasks(status='active')
+        for ct in self.active_tasks.values():
+            for t in ct.values():
+                t.cancel()
+        await asyncio.sleep(0)
+        for r in all_t:
+            self.db.set_task_status(r['task_id'], 'paused')
+        await self.log(f"⏸ Призупинено {len(all_t)}")
+        await e.delete()
 
-        @self.client.on(events.NewMessage(outgoing=True, pattern=r'^!continue(?!all)'))
-        async def continue_handler(event) -> None:
-            chat_info = await self.get_chat_info(event.chat_id)
-            parts = event.raw_text.strip().split()
-            if len(parts) < 2:
-                await self.log(f"{chat_info}❌ Вкажіть ID: `!continue <id>`")
-                await event.delete()
-                return
-            await self._resume_one(parts[1], chat_info)
-            await event.delete()
+    async def _handle_continue(self, e) -> None:
+        parts = e.raw_text.strip().split()
+        if len(parts) < 2:
+            await self.log("❌ `!continue <id>`")
+            await e.delete()
+            return
+        tid = parts[1]
+        row = self.db.get_spam_task(tid)
+        if not row or row['status'] != 'paused':
+            await self.log(f"❌ [{tid}] не знайдено або не призупинена")
+            await e.delete()
+            return
+        
+        remaining = row['total_count'] - row['sent_count']
+        if remaining <= 0:
+            self.db.remove_spam_task(tid)
+            await self.log(f"ℹ️ [{tid}] завершена")
+            await e.delete()
+            return
+        
+        self.db.set_task_status(tid, 'active')
+        await self.log(f"▶️ [{tid}] Відновлено")
+        
+        wd = parse_weekdays_from_db(row['weekdays'] if 'weekdays' in row.keys() else None)
+        st = row['scheduled_time'] if 'scheduled_time' in row.keys() else None
+        
+        self._start(row['chat_id'], tid,
+                   self._spam(row['chat_id'], tid, row['message'], row['delay'], remaining,
+                             scheduled_time=st, weekdays=wd))
+        await e.delete()
 
-        @self.client.on(events.NewMessage(outgoing=True, pattern=r'^!continueall'))
-        async def continueall_handler(event) -> None:
-            chat_info = await self.get_chat_info(event.chat_id)
-            paused = self.db.get_all_spam_tasks(status='paused')
-            if not paused:
-                await self.log(f"{chat_info}ℹ️ Немає призупинених розсилок.")
-                await event.delete()
-                return
-            resumed = 0
-            for row in paused:
-                if await self._resume_one(row['task_id'], chat_info, silent=True):
-                    resumed += 1
-            await self.log(f"{chat_info}▶️ Відновлено {resumed} розсилок.")
-            await event.delete()
+    async def _handle_continueall(self, e) -> None:
+        paused = self.db.get_all_spam_tasks(status='paused')
+        resumed = 0
+        for r in paused:
+            remaining = r['total_count'] - r['sent_count']
+            if remaining > 0:
+                self.db.set_task_status(r['task_id'], 'active')
+                wd = parse_weekdays_from_db(r['weekdays'] if 'weekdays' in r.keys() else None)
+                st = r['scheduled_time'] if 'scheduled_time' in r.keys() else None
+                self._start(r['chat_id'], r['task_id'],
+                           self._spam(r['chat_id'], r['task_id'], r['message'], r['delay'], remaining,
+                                     scheduled_time=st, weekdays=wd))
+                resumed += 1
+            else:
+                self.db.remove_spam_task(r['task_id'])
+        await self.log(f"▶️ Відновлено {resumed}")
+        await e.delete()
 
-        @self.client.on(events.NewMessage(outgoing=True, pattern=r'^!status'))
-        async def status_handler(event) -> None:
-            chat_info = await self.get_chat_info(event.chat_id)
-            all_tasks = self.db.get_all_spam_tasks()
-            if not all_tasks:
-                await self.log(f"{chat_info}ℹ️ Немає розсилок.")
-                await event.delete()
-                return
-            lines = []
-            for row in all_tasks:
-                tid        = row['task_id']
-                cid        = row['chat_id']
-                msg        = row['message']
-                status     = row['status']
-                sent       = row['sent_count']
-                total      = row['total_count']
-                delay      = row['delay']
-                next_in    = get_remaining_wait(row)
-                status_str = "▶️ Активна" if status == 'active' else "⏸ Призупинена"
-                cname      = await self.get_chat_name(cid)
-                lines.append(
-                    f"• [{tid}] {cname}\n"
-                    f"  {status_str}\n"
-                    f"  💬 {msg[:40]}{'...' if len(msg) > 40 else ''}\n"
-                    f"  📊 {sent}/{total} · ⏱ {format_time(delay)}\n"
-                    f"  ⏳ Наступне через: {format_time(next_in)}\n"
-                )
-            await self.log(
-                f"{chat_info}📊 **Розсилки:**\n\n" + "".join(lines) +
-                "\n`!stop <id>` · `!stop` · `!pause <id>` · `!pauseall` · `!continue <id>` · `!continueall`"
+    async def _handle_status(self, e) -> None:
+        all_t = self.db.get_all_spam_tasks()
+        if not all_t:
+            await self.log("ℹ️ Немає розсилок")
+            await e.delete()
+            return
+        lines = []
+        for r in all_t:
+            st = "▶️" if r['status'] == 'active' else "⏸"
+            cn = await self.get_chat_name(r['chat_id'])
+            msg_short = r['message'][:40] + ('...' if len(r['message']) > 40 else '')
+            lines.append(
+                f"• [{r['task_id']}] {st} {cn}\n"
+                f"  💬 {msg_short}\n"
+                f"  📊 {r['sent_count']}/{r['total_count']}\n"
             )
-            await event.delete()
+        await self.log("📊 Розсилки:\n\n" + "".join(lines))
+        await e.delete()
 
-        @self.client.on(events.NewMessage(outgoing=True, pattern=r'^!help'))
-        async def help_handler(event) -> None:
-            chat_info = await self.get_chat_info(event.chat_id)
-            await self.log(
-                f"{chat_info}🤖 **Команди Userbot**\n\n"
-                "📤 `!spam <час> <кількість> <текст>` — запустити розсилку\n"
-                "   Можна запускати кілька паралельно в одному чаті.\n\n"
-                "⛔️ `!stop <id>` — зупинити і видалити конкретну\n"
-                "⛔️ `!stop` — зупинити і видалити **всі**\n\n"
-                "⏸ `!pause <id>` — призупинити конкретну\n"
-                "⏸ `!pauseall` — призупинити **всі**\n\n"
-                "▶️ `!continue <id>` — продовжити конкретну\n"
-                "▶️ `!continueall` — продовжити **всі** призупинені\n\n"
-                "📊 `!status` — список всіх розсилок\n"
-                "🆔 `!chatid` — ID поточного чату\n"
-                "⚙️ `!setlog` — встановити чат для логів\n"
-                "❓ `!help` — ця довідка\n\n"
-                "⏱ **Формати часу:** `30с`, `5хв`, `2г`, `1д`, `1г30хв`\n\n"
-                "⚠️ Масова розсилка може призвести до блокування акаунта!"
-            )
-            await event.delete()
+    async def _handle_help(self, e) -> None:
+        await self.log(
+            "🤖 Команди\n\n"
+            "📤 `!spam <текст> <затримка> <кількість> [час] [дні]`\n"
+            "⛔️ `!stop <id>` | `!stop`\n"
+            "⏸ `!pause <id>` | `!pauseall`\n"
+            "▶️ `!continue <id>` | `!continueall`\n"
+            "📊 `!status` · 🆔 `!chatid` · ⚙️ `!setlog` · 🚀 `!start`"
+        )
+        await e.delete()
 
-        @self.client.on(events.NewMessage(outgoing=True, pattern=r'^!setlog'))
-        async def setlog_handler(event) -> None:
-            chat_id = event.chat_id
-            self.log_chat = chat_id
-            self.db.set_config('log_chat_id', chat_id)
-            await self.log(f"✅ Чат для логів: **{await self.get_chat_name(chat_id)}** (`{chat_id}`)")
-            await event.delete()
+    async def _handle_setlog(self, e) -> None:
+        self.log_chat = e.chat_id
+        self.db.set_config('log_chat_id', e.chat_id)
+        await self.log(f"✅ Лог-чат: {await self.get_chat_name(e.chat_id)}")
+        await e.delete()
 
-        @self.client.on(events.NewMessage(outgoing=True, pattern=r'^!chatid'))
-        async def chatid_handler(event) -> None:
-            chat_id = event.chat_id
-            await self.log(f"ℹ️ **{await self.get_chat_name(chat_id)}**\n🆔 `{chat_id}`")
-            await event.delete()
+    async def _handle_chatid(self, e) -> None:
+        await self.log(f"🆔 {await self.get_chat_name(e.chat_id)}: `{e.chat_id}`")
+        await e.delete()
 
-        @self.client.on(events.NewMessage(outgoing=True, pattern=r'^!start'))
-        async def start_handler(event) -> None:
-            chat_info = await self.get_chat_info(event.chat_id)
-            await self.log(
-                f"{chat_info}👋 **Вітаю!**\n\n"
-                "Цей бот допоможе надсилати повторювані повідомлення автоматично.\n\n"
-                "**Що можна робити:**\n"
-                "• Запустити розсилку: `!spam 30с 10 Текст повідомлення`\n"
-                "• Кілька розсилок одночасно в одному чаті\n"
-                "• Призупинити і продовжити в будь-який момент\n"
-                "• Переглянути статус: `!status`\n\n"
-                "**⚙️ Перший крок:**\n"
-                "Відкрий чат куди хочеш отримувати звіти і напиши `!setlog`\n\n"
-                "Повний список команд: `!help`"
-            )
-            await event.delete()
+    async def _handle_start(self, e) -> None:
+        await self.log(
+            "👋 Вітаю!\n\n"
+            "Бот надсилає повторювані повідомлення.\n\n"
+            "`!spam Привіт 1д 10` — щодня в цей час\n"
+            "`!spam Привіт 1д 10 14:30 пн,ср` — о 14:30 тільки пн/ср\n\n"
+            "Перший крок: `!setlog` в потрібному чаті\n"
+            "`!help` — всі команди"
+        )
+        await e.delete()
 
-    # ============ ЗАПУСК ============
+    def _register_handlers(self) -> None:
+        self.client.on(events.NewMessage(outgoing=True, pattern=r'^!spam'))(self._handle_spam)
+        self.client.on(events.NewMessage(outgoing=True, pattern=r'^!stop'))(self._handle_stop)
+        self.client.on(events.NewMessage(outgoing=True, pattern=r'^!pause(?!all)'))(self._handle_pause)
+        self.client.on(events.NewMessage(outgoing=True, pattern=r'^!pauseall'))(self._handle_pauseall)
+        self.client.on(events.NewMessage(outgoing=True, pattern=r'^!continue(?!all)'))(self._handle_continue)
+        self.client.on(events.NewMessage(outgoing=True, pattern=r'^!continueall'))(self._handle_continueall)
+        self.client.on(events.NewMessage(outgoing=True, pattern=r'^!status'))(self._handle_status)
+        self.client.on(events.NewMessage(outgoing=True, pattern=r'^!help'))(self._handle_help)
+        self.client.on(events.NewMessage(outgoing=True, pattern=r'^!setlog'))(self._handle_setlog)
+        self.client.on(events.NewMessage(outgoing=True, pattern=r'^!chatid'))(self._handle_chatid)
+        self.client.on(events.NewMessage(outgoing=True, pattern=r'^!start'))(self._handle_start)
 
     async def start(self) -> None:
         init_db(self.account_id)
-
         saved = self.db.get_config('log_chat_id', default=None)
         if saved and saved != 'me':
             self.log_chat = int(saved)
 
         await self.client.start(phone=self.phone)
-
         me = await self.client.get_me()
         self.username = f"@{me.username}" if me.username else me.first_name
-
-        self._log(f"✅ Запущено, LOG_CHAT={self.log_chat}")
+        self._log("✅ Запущено")
 
         if isinstance(self.log_chat, int):
-            async for dialog in self.client.iter_dialogs(limit=100):
-                if dialog.id == self.log_chat:
-                    self._log(f"✅ Лог-чат: {dialog.name}")
+            async for d in self.client.iter_dialogs(limit=100):
+                if d.id == self.log_chat:
+                    self._log(f"✅ Лог-чат: {d.name}")
                     break
 
-        # Відновлення активних розсилок
-        for row in self.db.get_all_spam_tasks(status='active'):
-            tid       = row['task_id']
-            cid       = row['chat_id']
-            remaining = row['total_count'] - row['sent_count']
+        for r in self.db.get_all_spam_tasks(status='active'):
+            remaining = r['total_count'] - r['sent_count']
             if remaining > 0:
-                initial_wait = get_remaining_wait(row)
-                self._start_task(cid, tid,
-                    self.send_spam_messages(cid, tid, row['message'], row['delay'], remaining,
-                                            initial_wait=initial_wait))
-                self._log(f"✅ [{tid}] відновлено, залишилось: {remaining}, чекати: {initial_wait}с")
+                wd = parse_weekdays_from_db(r['weekdays'] if 'weekdays' in r.keys() else None)
+                st = r['scheduled_time'] if 'scheduled_time' in r.keys() else None
+                self._start(r['chat_id'], r['task_id'],
+                           self._spam(r['chat_id'], r['task_id'], r['message'], r['delay'], remaining,
+                                     scheduled_time=st, weekdays=wd))
+                self._log(f"✅ [{r['task_id']}] відновлено")
             else:
-                self.db.remove_spam_task(tid)
+                self.db.remove_spam_task(r['task_id'])
 
-        await self.log(
-            "✅ Userbot запущено!\n\n"
-            "📝 Цей чат — для логів\n"
-            "`!help` — довідка · `!setlog` — змінити чат логів"
-        )
-
-    async def run(self) -> None:
-        await self.start()
-        await self.client.run_until_disconnected()
+        await self.log("✅ Userbot запущено\n`!help` — довідка")
 
     def stop(self) -> None:
-        for chat_tasks in self.active_tasks.values():
-            for task in chat_tasks.values():
-                task.cancel()
+        for ct in self.active_tasks.values():
+            for t in ct.values():
+                t.cancel()
 
 
-# ============ ТОЧКА ВХОДУ ============
+# ============ MAIN ============
 
 async def main() -> None:
     accounts_cfg = load_accounts()
     if not accounts_cfg:
-        print("[ERROR] Не знайдено жодного акаунта в .env!")
-        print("[ERROR] Формат: ACCOUNT_1_API_ID, ACCOUNT_1_API_HASH, ACCOUNT_1_PHONE")
+        print("[ERROR] Не знайдено акаунтів в .env")
         return
 
-    accounts = [Account(**cfg) for cfg in accounts_cfg]
+    accounts = [Account(**c) for c in accounts_cfg]
     print(f"[INFO] Завантажено {len(accounts)} акаунт(ів)")
 
     stop_event = asyncio.Event()
 
     async def _shutdown(sig: signal.Signals) -> None:
-        print(f"[INFO] Отримано сигнал {sig.name}, зберігаємо стан...")
-        for acc in accounts:
-            acc.stop()
-        await asyncio.gather(*[acc.client.disconnect() for acc in accounts])
-        print("[INFO] Виходимо.")
+        print(f"[INFO] {sig.name}, зберігаємо стан...")
+        for a in accounts:
+            a.stop()
+        await asyncio.gather(*[a.client.disconnect() for a in accounts])
+        print("[INFO] Виходимо")
         stop_event.set()
 
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(_shutdown(s)))
 
-    for acc in accounts:
-        await acc.start()
+    for a in accounts:
+        await a.start()
 
     print("[INFO] ⛔️ Ctrl+C для виходу")
-
-    # Після авторизації — запускаємо всіх паралельно
-    await asyncio.gather(*[acc.client.run_until_disconnected() for acc in accounts])
+    await asyncio.gather(*[a.client.run_until_disconnected() for a in accounts])
 
 
 if __name__ == '__main__':
